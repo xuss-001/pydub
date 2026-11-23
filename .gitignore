@@ -10,3 +10,11 @@ env
 
 /build/
 .remote-sync.json
+
+# Local credentials must never enter snapshots.
+/.env
+/.env.local
+/private.key
+/auth.json
+/credentials-local.json
+/access-token.json
