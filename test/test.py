@@ -32,6 +32,8 @@ from pydub.silence import (
     detect_silence,
     split_on_silence,
 )
+from pydub.convolution import ConvolutionReverb, convolve
+from pydub.exceptions import ConvolutionError
 from pydub.generators import (
     Sine,
     Square,
@@ -40,6 +42,8 @@ from pydub.generators import (
     Sawtooth,
     WhiteNoise,
 )
+
+import numpy as np
 
 data_dir = os.path.join(os.path.dirname(__file__), 'data')
 
@@ -1394,6 +1398,283 @@ class PartialAudioSegmentLoadTests(unittest.TestCase):
         partial_seg2 = AudioSegment.from_file(self.raw_path_str, format="raw", sample_width=2, frame_rate=32000, channels=2, start_second=1., duration=1.)
         self.assertEqual(len(partial_seg1), len(partial_seg2))
         self.assertEqual(partial_seg1._data, partial_seg2._data)
+
+
+class ConvolutionReverbTests(unittest.TestCase):
+
+    def _segment(self, samples, sample_width=2, frame_rate=8000, channels=1):
+        dtype = {1: np.int8, 2: np.int16, 4: np.int32}[sample_width]
+        data = np.asarray(samples, dtype=dtype)
+        if channels > 1:
+            data = data.reshape(-1, channels)
+        return AudioSegment(
+            data.tobytes(),
+            metadata={
+                "channels": channels,
+                "sample_width": sample_width,
+                "frame_rate": frame_rate,
+                "frame_width": sample_width * channels,
+            })
+
+    def _sample_chunks(self, segment, chunk_frames):
+        total = int(segment.frame_count())
+        return [
+            segment.get_sample_slice(i, min(i + chunk_frames, total))
+            for i in range(0, total, chunk_frames)
+        ]
+
+    def _run_stream(self, source, impulse_response, chunk_frames,
+                    dry_gain=1.0, wet_gain=1.0):
+        reverb = ConvolutionReverb(
+            impulse_response, dry_gain=dry_gain, wet_gain=wet_gain)
+        parts = [
+            reverb.process(chunk)
+            for chunk in self._sample_chunks(source, chunk_frames)
+        ]
+        parts.append(reverb.flush())
+        return parts[0]._spawn(b"".join(part._data for part in parts))
+
+    def _reference(self, samples, kernel, full_scale, dry_gain, wet_gain,
+                   sample_width):
+        samples = np.asarray(samples, dtype=np.float64)
+        kernel = np.asarray(kernel, dtype=np.float64) / full_scale
+        kernel_length = len(kernel)
+        dry = np.concatenate([
+            dry_gain * samples,
+            np.zeros(kernel_length - 1)
+        ])
+        wet = wet_gain * np.convolve(samples, kernel)
+        minimum = -(2 ** (sample_width * 8 - 1))
+        maximum = 2 ** (sample_width * 8 - 1) - 1
+        return np.clip(np.rint(dry + wet), minimum, maximum).astype(np.int64)
+
+    def test_chunking_matches_full_convolution(self):
+        source = self._segment(
+            [100, -200, 300, -400, 500, 0, -123, 77, 9, -10])
+        impulse = self._segment([1000, 0, -500, 250])
+
+        reference = self._reference(
+            [100, -200, 300, -400, 500, 0, -123, 77, 9, -10],
+            [1000, 0, -500, 250], 32767, 1.0, 1.0, 2)
+
+        outputs = {}
+        for chunk_frames in (1, 2, 3, 5, 7, 100):
+            result = self._run_stream(source, impulse, chunk_frames)
+            samples = np.asarray(result.get_array_of_samples(), dtype=np.int64)
+            self.assertEqual(len(samples), len(reference))
+            self.assertLessEqual(
+                np.max(np.abs(samples - reference)), 1)
+            outputs[chunk_frames] = samples
+
+        baseline = outputs[1]
+        for samples in outputs.values():
+            self.assertLessEqual(np.max(np.abs(samples - baseline)), 1)
+
+        one_shot = np.asarray(
+            convolve(source, impulse).get_array_of_samples(), dtype=np.int64)
+        self.assertLessEqual(np.max(np.abs(one_shot - reference)), 1)
+
+    def test_delayed_echo_and_tail_length(self):
+        source = self._segment([100, -100, 50])
+        impulse = self._segment([0, 0, 0, 32767])
+
+        result = convolve(source, impulse, dry_gain=0.0, wet_gain=1.0)
+        self.assertEqual(
+            list(result.get_array_of_samples()),
+            [0, 0, 0, 100, -100, 50])
+
+        reverb = ConvolutionReverb(impulse, dry_gain=0.0)
+        processed = reverb.process(source)
+        self.assertEqual(processed.frame_count(), source.frame_count())
+        tail = reverb.flush()
+        self.assertEqual(tail.frame_count(), 3)
+        self.assertEqual(reverb.flush().frame_count(), 0)
+
+    def test_tail_contains_no_duplicated_or_lost_samples(self):
+        rng = np.random.RandomState(7)
+        source = self._segment(rng.randint(-80, 80, 53).tolist())
+        impulse = self._segment(rng.randint(-40, 40, 9).tolist())
+
+        reverb = ConvolutionReverb(impulse)
+        frame_count = 0
+        for chunk in self._sample_chunks(source, 6):
+            processed = reverb.process(chunk)
+            frame_count += int(processed.frame_count())
+        frame_count += int(reverb.flush().frame_count())
+
+        self.assertEqual(frame_count, 53 + 9 - 1)
+
+    def test_mono_impulse_is_applied_per_channel_with_isolation(self):
+        left = [10, -20, 30, 0, 5]
+        right = [1, -2, 3, 0, -5]
+        interleaved = [
+            sample for frame in zip(left, right) for sample in frame]
+        source = self._segment(interleaved, channels=2)
+        impulse = self._segment([32767, 0, -32767])
+
+        original_data = source._data
+        result = convolve(source, impulse)
+        self.assertEqual(source._data, original_data)
+
+        samples = np.asarray(
+            result.get_array_of_samples(), dtype=np.int64).reshape(-1, 2)
+        reference_left = self._reference(
+            left, [1, 0, -1], 1, 1.0, 1.0, 2)
+        reference_right = self._reference(
+            right, [1, 0, -1], 1, 1.0, 1.0, 2)
+        np.testing.assert_array_equal(samples[:, 0], reference_left)
+        np.testing.assert_array_equal(samples[:, 1], reference_right)
+
+    def test_multichannel_impulse_matches_channels_with_isolation(self):
+        left = [10, -20, 30, 0, 5]
+        right = [1, -2, 3, 0, -5]
+        interleaved = [
+            sample for frame in zip(left, right) for sample in frame]
+        source = self._segment(interleaved, channels=2)
+
+        impulse_left = self._segment([32767, 0])
+        impulse_right = self._segment([0, 32767])
+        impulse = AudioSegment.from_mono_audiosegments(
+            impulse_left, impulse_right)
+
+        result = convolve(source, impulse, dry_gain=0.0, wet_gain=1.0)
+        samples = np.asarray(
+            result.get_array_of_samples(), dtype=np.int64).reshape(-1, 2)
+        self.assertEqual(list(samples[:, 0]), left + [0])
+        self.assertEqual(list(samples[:, 1]), [0] + right)
+
+    def test_channel_mismatch_raises(self):
+        source = self._segment(list(range(9)), channels=3)
+        impulse = self._segment([1, 2, 3]).set_channels(2)
+        reverb = ConvolutionReverb(impulse)
+        with self.assertRaises(ConvolutionError):
+            reverb.process(source)
+
+    def test_empty_impulse_and_empty_input(self):
+        with self.assertRaises(ConvolutionError):
+            ConvolutionReverb(self._segment([]))
+
+        impulse = self._segment([32767])
+        reverb = ConvolutionReverb(impulse)
+        self.assertEqual(reverb.flush().frame_count(), 0)
+        self.assertEqual(
+            convolve(self._segment([]), impulse).frame_count(), 0)
+
+    def test_gains_must_be_finite(self):
+        impulse = self._segment([32767])
+        for invalid in (
+                float("inf"), float("-inf"), float("nan"),
+                "1.0", None, True, False):
+            with self.assertRaises((ValueError, TypeError)):
+                ConvolutionReverb(impulse, dry_gain=invalid)
+            with self.assertRaises((ValueError, TypeError)):
+                ConvolutionReverb(impulse, wet_gain=invalid)
+
+        reverb = ConvolutionReverb(
+            impulse, dry_gain=-1.0, wet_gain=-0.25)
+        result = reverb.process(self._segment([100])) + reverb.flush()
+        self.assertEqual(list(result.get_array_of_samples()), [-125])
+
+    def test_subsequent_blocks_must_match_first_block_format(self):
+        source = self._segment([1, 2, 3, 4], channels=2)
+        impulse = self._segment([32767])
+        reverb = ConvolutionReverb(impulse)
+        reverb.process(source)
+
+        with self.assertRaises(ConvolutionError):
+            reverb.process(source.set_frame_rate(16000))
+        with self.assertRaises(ConvolutionError):
+            reverb.process(source.set_sample_width(4))
+        with self.assertRaises(ConvolutionError):
+            reverb.process(source.set_channels(1))
+
+    def test_impulse_rate_and_width_are_converted_to_first_block(self):
+        impulse = self._segment([100, 0, -50], frame_rate=16000)
+        source = self._segment([1, 2, 3, 4, 5, 6, 7, 8], frame_rate=8000)
+        reverb = ConvolutionReverb(impulse, wet_gain=1.0)
+        reverb.process(source)
+        self.assertEqual(reverb._template.frame_rate, 8000)
+
+        wide_impulse = self._segment([32767 * 65536], sample_width=4)
+        reverb = ConvolutionReverb(wide_impulse, wet_gain=1.0)
+        reverb.process(self._segment([100, -100, 50]))
+        self.assertEqual(reverb._template.sample_width, 2)
+        self.assertAlmostEqual(reverb._ir_channels[0][0], 1.0)
+
+    def test_impulse_samples_are_normalized_to_pcm_full_scale(self):
+        source = self._segment([100, -100, 50])
+        for sample_width, half_scale in (
+                (1, 64), (2, 16384), (4, 2147483648 // 2)):
+            impulse = self._segment([half_scale], sample_width=sample_width)
+            result = convolve(
+                source, impulse, dry_gain=0.0, wet_gain=1.0)
+            self.assertEqual(
+                list(result.get_array_of_samples()), [50, -50, 25])
+
+    def test_output_saturates_across_sample_widths(self):
+        for sample_width in (1, 2, 4):
+            minimum = -(2 ** (sample_width * 8 - 1))
+            maximum = 2 ** (sample_width * 8 - 1) - 1
+            source = self._segment(
+                [maximum - 5, minimum + 5, 0, -10, 10],
+                sample_width=sample_width)
+            impulse = self._segment([maximum], sample_width=sample_width)
+            result = convolve(
+                source, impulse, dry_gain=2.0, wet_gain=2.0)
+            samples = list(result.get_array_of_samples())
+            self.assertEqual(samples[0], maximum)
+            self.assertEqual(samples[1], minimum)
+            self.assertTrue(all(minimum <= value <= maximum for value in samples))
+
+    def test_streaming_state_does_not_grow_with_input_length(self):
+        rng = np.random.RandomState(11)
+        source = self._segment(rng.randint(-100, 100, 1000).tolist())
+        impulse = self._segment([1, 2, 3])
+        reverb = ConvolutionReverb(impulse)
+        for chunk in self._sample_chunks(source, 7):
+            reverb.process(chunk)
+        self.assertTrue(all(len(history) == 2 for history in reverb._history))
+        reverb.flush()
+
+    def test_random_signals_match_reference_for_widths_and_channels(self):
+        rng = np.random.RandomState(42)
+        for sample_width, channels in (
+                (1, 1), (2, 1), (4, 1), (2, 2)):
+            dtype = {1: np.int8, 2: np.int16, 4: np.int32}[sample_width]
+            source_data = rng.randint(-50, 50, (307, channels)).astype(dtype)
+            impulse_data = rng.randint(-30, 30, (13, channels)).astype(dtype)
+            source = self._segment(
+                source_data, sample_width=sample_width, channels=channels)
+            impulse = self._segment(
+                impulse_data, sample_width=sample_width, channels=channels)
+            full_scale = 2 ** (sample_width * 8 - 1) - 1
+
+            reference = np.stack([
+                self._reference(
+                    source_data[:, channel],
+                    impulse_data[:, channel], full_scale,
+                    0.7, 1.3, sample_width)
+                for channel in range(channels)
+            ], axis=1)
+
+            for chunk_frames in (1, 7, 64, 500):
+                result = self._run_stream(
+                    source, impulse, chunk_frames,
+                    dry_gain=0.7, wet_gain=1.3)
+                samples = np.asarray(
+                    result.get_array_of_samples(),
+                    dtype=np.int64).reshape(-1, channels)
+                self.assertEqual(samples.shape, reference.shape)
+                self.assertLessEqual(
+                    np.max(np.abs(samples - reference)), 1)
+
+    def test_process_after_flush_raises(self):
+        source = self._segment([1, 2, 3])
+        reverb = ConvolutionReverb(self._segment([32767]))
+        reverb.process(source)
+        reverb.flush()
+        with self.assertRaises(ConvolutionError):
+            reverb.process(source)
 
 
 if __name__ == "__main__":

@@ -30,3 +30,7 @@ class CouldntEncodeError(PydubException):
 
 class MissingAudioParameter(PydubException):
     pass
+
+
+class ConvolutionError(PydubException):
+    pass

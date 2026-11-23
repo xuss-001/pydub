@@ -691,3 +691,67 @@ print(silence.detect_leading_silence(AudioSegment.silent(2000)))
 
 - `chunk_size` | example: `5` | default: 10
   Size of the step for checking for silence in milliseconds. Smaller is more precise. Must be a positive whole number.
+
+## Convolution reverb
+
+Convolution with an impulse response applies the acoustics captured in that
+response (for example a room) to any audio. The streaming implementation
+processes arbitrary-length recordings block by block while keeping only the
+overlap between blocks in memory.
+
+Impulse response samples are normalized to the full-scale amplitude of their
+own bit depth, so the response can use 8-, 16- or 32-bit PCM. Its sample rate
+and sample width are converted automatically to match the first input block.
+A mono impulse response is applied to every input channel; a response with the
+same number of channels as the input is applied channel by channel. Every
+input block after the first must use the same frame rate, sample width and
+channel count as the first one.
+
+### AudioSegment(…).convolve()
+
+One-shot wrapper for signals that fit in memory. The returned segment includes
+the reverb tail and therefore has
+`input.frame_count() + impulse_response.frame_count() - 1` frames.
+
+```python
+wet_recording = recording.convolve(
+    impulse_response,
+    dry_gain=1.0,   # linear gain of the original signal
+    wet_gain=0.7,   # linear gain of the reverberant signal
+)
+```
+
+**Supported keyword arguments**:
+
+- `impulse_response` | an `AudioSegment` containing at least one sample.
+  An empty response raises `pydub.exceptions.ConvolutionError`.
+- `dry_gain` | example: `0.9` | default: `1.0`
+  Linear gain for the unprocessed signal. Must be a finite number; infinity
+  and NaN raise `ValueError`.
+- `wet_gain` | example: `0.6` | default: `1.0`
+  Linear gain for the convolved signal. Must be a finite number.
+
+### ConvolutionReverb
+
+Streaming counterpart for long recordings that are read in blocks. Memory use
+depends on the impulse response length, not on the recording length. After the
+last block, call `flush()` once to obtain the remaining tail; calling it again
+returns an empty segment instead of repeating samples.
+
+```python
+from pydub.convolution import ConvolutionReverb
+from pydub.utils import make_chunks
+
+reverb = ConvolutionReverb(
+    impulse_response, dry_gain=1.0, wet_gain=0.7)
+
+output = AudioSegment.empty()
+for block in make_chunks(long_recording, 100):
+    output += reverb.process(block)
+output += reverb.flush()
+```
+
+Samples that would exceed the output bit depth are saturated to the minimum
+or maximum representable value. Block-wise processing matches a single
+full-length convolution within one integer sample regardless of the chosen
+block size. Input segments are never modified.
