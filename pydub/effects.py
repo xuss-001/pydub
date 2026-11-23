@@ -1,6 +1,7 @@
 import sys
 import math
 import array
+import numbers
 from .utils import (
     db_to_float,
     ratio_to_db,
@@ -92,7 +93,140 @@ def speedup(seg, playback_speed=1.5, chunk_size=150, crossfade=25):
 
     out += last_chunk
     return out
-    
+
+
+def _wsola_time_stretch(samples, speed, n_out, frame_rate, window_ms=40.0):
+    """
+    WSOLA (Waveform Similarity Overlap-Add) time-scale modification.
+
+    samples: float64 numpy array of shape (n_in, channels), normalized to
+    roughly [-1.0, 1.0]. All channels are stretched using a single shared
+    time mapping (the segment offset search is done on the channel mix) so
+    inter-channel phase relations are preserved.
+
+    Returns a float64 array of shape (n_out, channels).
+    """
+    import numpy as np
+
+    n_in, channels = samples.shape
+
+    win_len = int(round(frame_rate * window_ms / 1000.0))
+    win_len = max(1, min(win_len, n_in))
+    hop = max(1, win_len // 4)
+    max_delta = hop
+
+    window = np.hanning(win_len)
+    if win_len >= 2 and window[1] == 0.0:
+        # extremely short windows: np.hanning degenerates, fall back to ones
+        window = np.ones(win_len)
+
+    pad = win_len + max_delta + 2 * hop + 2
+    if n_in >= 2:
+        padded = np.pad(samples, ((pad, pad), (0, 0)), mode='reflect')
+    else:
+        padded = np.pad(samples, ((pad, pad), (0, 0)), mode='constant')
+    mono = padded.mean(axis=1)
+
+    out = np.zeros((n_out + win_len, channels), dtype=np.float64)
+    out_mono = np.zeros(n_out + win_len, dtype=np.float64)
+    weight = np.zeros(n_out + win_len, dtype=np.float64)
+
+    ref_len = win_len - hop
+    deltas = np.arange(-max_delta, max_delta + 1)
+
+    k = 0
+    while k * hop < n_out:
+        o = k * hop
+        # input position (in original, unpadded coordinates) that
+        # corresponds to output position o
+        nominal = o * speed + pad - win_len // 2
+        start0 = int(round(nominal))
+
+        delta = 0
+        if k > 0 and ref_len > 0 and max_delta > 0:
+            ref = out_mono[o:o + ref_len]
+            ref_norm = np.sqrt(np.dot(ref, ref))
+            if ref_norm > 1e-12:
+                base = start0 - max_delta
+                cand = np.lib.stride_tricks.as_strided(
+                    mono[base:base + len(deltas) + ref_len - 1],
+                    shape=(len(deltas), ref_len),
+                    strides=(mono.strides[0], mono.strides[0]))
+                corrs = cand.dot(ref)
+                cand_norms = np.sqrt((cand ** 2).sum(axis=1)) * ref_norm
+                scores = corrs / (cand_norms + 1e-20)
+                best = np.flatnonzero(scores >= scores.max() - 1e-12)
+                # prefer the offset closest to zero on ties
+                delta = deltas[best[np.argmin(np.abs(deltas[best]))]]
+
+        start = start0 + delta
+        segment = padded[start:start + win_len]
+        out[o:o + win_len] += segment * window[:, None]
+        out_mono[o:o + win_len] += segment.mean(axis=1) * window
+        weight[o:o + win_len] += window
+        k += 1
+
+    out = out[:n_out]
+    weight = weight[:n_out]
+    nonzero = weight > 1e-8
+    out[nonzero] /= weight[nonzero, None]
+    out[~nonzero] = 0.0
+    return out
+
+
+@register_pydub_effect
+def time_stretch(seg, playback_speed=1.0, window_ms=40.0):
+    """
+    Change the duration of the audio without changing its pitch, using
+    WSOLA (Waveform Similarity Overlap-Add).
+
+    playback_speed values greater than 1.0 shorten the audio, values
+    between 0.0 and 1.0 lengthen it. The output keeps the frame rate,
+    sample width and channel count of the input, and its frame count is
+    round(input_frames / playback_speed). All channels share a single
+    time mapping so stereo phase relations are preserved. The original
+    AudioSegment is not modified; a playback_speed of exactly 1.0
+    returns the original samples unchanged.
+
+    window_ms is the analysis window length in milliseconds (default 40).
+    """
+    import numpy as np
+
+    if isinstance(playback_speed, bool) or not isinstance(
+            playback_speed, numbers.Real):
+        raise TypeError(
+            "playback_speed must be a real number, got %r" % (playback_speed,))
+    speed = float(playback_speed)
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise ValueError(
+            "playback_speed must be a positive, finite number, got %r"
+            % (playback_speed,))
+
+    frame_width = seg.sample_width * seg.channels
+    n_in = len(seg.raw_data) // frame_width
+    n_out = int(math.floor(n_in / speed + 0.5))
+
+    if n_in == 0 or n_out == 0:
+        return seg._spawn(b'')
+
+    if speed == 1.0:
+        return seg._spawn(seg.raw_data)
+
+    int_dtypes = {1: np.int8, 2: np.int16, 4: np.int32}
+    dtype = int_dtypes[seg.sample_width]
+    full_scale = float(2 ** (8 * seg.sample_width - 1))
+
+    samples = np.frombuffer(seg.raw_data, dtype=dtype)
+    samples = samples.astype(np.float64).reshape(n_in, seg.channels)
+    samples /= full_scale
+
+    stretched = _wsola_time_stretch(
+        samples, speed, n_out, seg.frame_rate, window_ms)
+
+    out = np.round(stretched * full_scale)
+    np.clip(out, -full_scale, full_scale - 1.0, out=out)
+    return seg._spawn(out.astype(dtype).tobytes())
+
 
 @register_pydub_effect
 def strip_silence(seg, silence_len=1000, silence_thresh=-16, padding=100):

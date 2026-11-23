@@ -612,6 +612,26 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).time_stretch()
+
+Change the duration of this `AudioSegment` without changing its pitch, using WSOLA (Waveform Similarity Overlap-Add). Unlike `AudioSegment(…).speedup()`, which throws away chunks of audio and can only speed up, `time_stretch()` preserves pitch and supports both speeding up and slowing down. The output keeps the frame rate, sample width and channel count of the input, its frame count is `round(input_frames / playback_speed)`, and all channels share a single time mapping so stereo phase relations are preserved. Requires numpy; does not use an external encoder.
+
+```python
+from pydub import AudioSegment
+
+sound = AudioSegment.from_file("voice.wav")
+shorter = sound.time_stretch(1.5)   # 1.5x faster, same pitch
+longer = sound.time_stretch(0.75)   # 0.75x slower, same pitch
+```
+
+**Supported keyword arguments**:
+
+- `playback_speed` | example: `1.5` | default: 1.0
+  Values greater than 1.0 shorten the audio, values between 0.0 and 1.0 lengthen it. Must be a positive, finite number (a `ValueError` is raised otherwise). Exactly 1.0 returns the original samples unchanged.
+
+- `window_ms` | example: `30.0` | default: 40.0
+  Analysis window length in milliseconds.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

@@ -1,3 +1,6 @@
+# Unreleased
+- Add `AudioSegment.time_stretch()`, a pitch-preserving time-stretch effect (WSOLA) supporting both speedup and slowdown while preserving frame rate, sample width, channel count and stereo phase (requires numpy)
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

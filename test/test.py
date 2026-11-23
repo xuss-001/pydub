@@ -1095,6 +1095,156 @@ class AudioSegmentTests(unittest.TestCase):
         os.rmdir(new_tmpdir)
 
 
+def _voice_surrogate(duration=0.8, frame_rate=22050, f0=120.0):
+    """
+    Short voice-like surrogate signal: a harmonic stack (formant-weighted)
+    with gentle vibrato and syllable-like amplitude modulation, standing in
+    for a speech recording without needing any audio assets.
+    """
+    import numpy as np
+
+    n = int(round(duration * frame_rate))
+    t = np.arange(n, dtype=np.float64) / frame_rate
+    # mild vibrato: instantaneous f0 wobbles +-1.5% at 5 Hz
+    phase_dev = 0.015 * f0 / 5.0 * np.sin(2 * np.pi * 5.0 * t)
+    signal = np.zeros(n, dtype=np.float64)
+    for harmonic in range(1, 9):
+        freq = f0 * harmonic
+        if freq >= frame_rate / 2:
+            break
+        # formant-ish weighting: energy concentrated near 600 Hz
+        weight = np.exp(-((freq - 600.0) ** 2) / (2 * 500.0 ** 2)) / harmonic
+        signal += weight * np.sin(2 * np.pi * freq * t + phase_dev * harmonic)
+    # syllable-like amplitude envelope
+    signal *= 0.6 + 0.4 * np.sin(2 * np.pi * 3.0 * t) ** 2
+    signal *= 0.4 / max(1e-12, np.abs(signal).max())
+    data = np.round(signal * 32767).astype('<i2').tobytes()
+    return AudioSegment(data=data, sample_width=2, frame_rate=frame_rate,
+                        channels=1)
+
+
+def _dominant_frequency(seg):
+    import numpy as np
+
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float64)
+    n = len(samples)
+    spectrum = np.abs(np.fft.rfft(samples * np.hanning(n)))
+    peak = int(np.argmax(spectrum))
+    # parabolic interpolation around the peak bin
+    left, center, right = spectrum[peak - 1], spectrum[peak], spectrum[peak + 1]
+    offset = 0.5 * (left - right) / (left - 2 * center + right)
+    return (peak + offset) * seg.frame_rate / n
+
+
+class TimeStretchTests(unittest.TestCase):
+
+    def setUp(self):
+        self.frame_rate = 44100
+        self.sine = Sine(440).to_audio_segment(duration=2000)
+        self.sine = self.sine.set_frame_rate(self.frame_rate)
+        self.sine = self.sine.set_channels(1).set_sample_width(2)
+
+    def test_invalid_playback_speed_raises(self):
+        for bad in (0, 0.0, -1, -0.5, float('nan'), float('inf'),
+                    float('-inf')):
+            self.assertRaises(ValueError, self.sine.time_stretch, bad)
+        for bad in ("2", "fast", None, [1.5]):
+            self.assertRaises(TypeError, self.sine.time_stretch, bad)
+
+    def test_speed_of_one_keeps_original_samples(self):
+        stretched = self.sine.time_stretch(1.0)
+        self.assertIsNot(stretched, self.sine)
+        self.assertEqual(stretched.raw_data, self.sine.raw_data)
+        self.assertEqual(stretched.frame_rate, self.sine.frame_rate)
+        self.assertEqual(stretched.sample_width, self.sine.sample_width)
+        self.assertEqual(stretched.channels, self.sine.channels)
+
+    def test_frame_count_double_and_half_speed(self):
+        in_frames = int(self.sine.frame_count())
+        doubled = self.sine.time_stretch(2.0)
+        halved = self.sine.time_stretch(0.5)
+        self.assertEqual(int(doubled.frame_count()), in_frames // 2)
+        self.assertEqual(int(halved.frame_count()), in_frames * 2)
+
+    def test_frame_count_rounds_to_nearest(self):
+        seg = self.sine[:23]  # 23 ms -> 1014 frames (+1 from rounding)
+        in_frames = int(seg.frame_count())
+        for speed in (0.5, 0.75, 1.5, 2.0, 3.3):
+            expected = int(in_frames / speed + 0.5)
+            self.assertEqual(int(seg.time_stretch(speed).frame_count()),
+                             expected)
+
+    def test_output_format_is_preserved(self):
+        stereo = self.sine.set_channels(2)
+        for seg in (self.sine, stereo, self.sine.set_sample_width(1),
+                    self.sine.set_sample_width(4)):
+            stretched = seg.time_stretch(1.5)
+            self.assertEqual(stretched.frame_rate, seg.frame_rate)
+            self.assertEqual(stretched.sample_width, seg.sample_width)
+            self.assertEqual(stretched.channels, seg.channels)
+
+    def test_original_segment_is_not_modified(self):
+        original_data = self.sine.raw_data
+        self.sine.time_stretch(2.0)
+        self.sine.time_stretch(0.5)
+        self.assertEqual(self.sine.raw_data, original_data)
+
+    def test_steady_sine_keeps_main_frequency(self):
+        for speed in (0.5, 0.75, 1.25, 1.5, 2.0):
+            stretched = self.sine.time_stretch(speed)
+            freq = _dominant_frequency(stretched)
+            self.assertAlmostEqual(freq, 440.0, delta=440.0 * 0.01)
+
+    def test_stereo_identical_channels_stay_identical(self):
+        mono = self.sine[:1000]
+        stereo = AudioSegment.from_mono_audiosegments(mono, mono)
+        for speed in (0.6, 1.7):
+            left, right = stereo.time_stretch(speed).split_to_mono()
+            self.assertEqual(left.raw_data, right.raw_data)
+
+    def test_stereo_opposite_channels_stay_opposite(self):
+        import numpy as np
+
+        mono = self.sine[:1000]
+        inverted = mono._spawn(
+            (-np.array(mono.get_array_of_samples())).astype('<i2'))
+        stereo = AudioSegment.from_mono_audiosegments(mono, inverted)
+        for speed in (0.6, 1.7):
+            left, right = stereo.time_stretch(speed).split_to_mono()
+            left_samples = np.array(left.get_array_of_samples())
+            right_samples = np.array(right.get_array_of_samples())
+            self.assertTrue(np.array_equal(left_samples, -right_samples))
+
+    def test_short_segments(self):
+        for ms in (5, 20, 50):
+            seg = self.sine[:ms]
+            in_frames = int(seg.frame_count())
+            for speed in (0.5, 2.0):
+                stretched = seg.time_stretch(speed)
+                expected = int(in_frames / speed + 0.5)
+                self.assertEqual(int(stretched.frame_count()), expected)
+                self.assertEqual(stretched.frame_rate, seg.frame_rate)
+
+    def test_silence_stays_silent(self):
+        silence = AudioSegment.silent(duration=1000, frame_rate=44100)
+        for speed in (0.5, 2.0):
+            stretched = silence.time_stretch(speed)
+            self.assertEqual(stretched.max, 0)
+            self.assertEqual(int(stretched.frame_count()),
+                             int(silence.frame_count() / speed + 0.5))
+
+    def test_voice_surrogate_example(self):
+        voice = _voice_surrogate()
+        in_frames = int(voice.frame_count())
+        for speed in (0.5, 2.0):
+            stretched = voice.time_stretch(speed)
+            self.assertEqual(int(stretched.frame_count()),
+                             int(in_frames / speed + 0.5))
+            freq = _dominant_frequency(stretched)
+            # vibrato smears the peak a little, allow 2% here
+            self.assertAlmostEqual(freq, 120.0, delta=120.0 * 0.02)
+
+
 class SilenceTests(unittest.TestCase):
 
     def setUp(self):
