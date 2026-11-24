@@ -417,6 +417,53 @@ quieter_via_method = sound1.apply_gain(-5.7)
 quieter_via_operator = sound1 - 5.7
 ```
 
+### Streaming volume envelopes
+
+For very long recordings, `VolumeEnvelopeProcessor` applies a dB envelope to
+raw PCM chunks without decoding or retaining the complete recording. Keypoints
+use absolute sample-frame positions in the recording; gain changes linearly in
+dB between keypoints, and the nearest value is held before the first and after
+the last keypoint.
+
+```python
+from pydub.volume_envelope import VolumeEnvelopeProcessor
+
+# 48 kHz stereo 16-bit PCM.  Change only the left (first) channel.
+processor = VolumeEnvelopeProcessor(
+    [(0, -6.0), (48000, 0.0), (96000, -3.0)],
+    channel=1,
+    sample_width=2,
+    channels=2,
+    frame_rate=48000,
+)
+
+with open("voice_48k_stereo.raw", "rb") as source:
+    with open("voice_with_envelope.raw", "wb") as destination:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            # process() returns the same number of frames it received.
+            destination.write(processor.process(chunk))
+```
+
+The first chunk fixes `sample_width`, `channels`, and optionally `frame_rate`;
+later chunks with a different format are rejected. Channels are numbered using
+pydub's 1-based convention (`1` is left/first), `channel=None` applies the
+envelope to every channel, and unselected channels are left byte-for-byte
+unchanged.
+
+The same envelope can be applied to a complete `AudioSegment`:
+
+```python
+from pydub import AudioSegment
+
+sound = AudioSegment.from_file("voice.wav")
+enveloped = sound.apply_volume_envelope(
+    [(0, -6.0), (sound.frame_count(ms=1000), 0.0)]
+)
+```
+
 ### AudioSegment(…).fade()
 
 A more general (more flexible) fade method. You may specify `start` and `end`, or one of the two along with duration (e.g., `start` and `duration`).

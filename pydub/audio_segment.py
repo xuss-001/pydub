@@ -41,6 +41,16 @@ from .exceptions import (
     CouldntEncodeError,
     MissingAudioParameter,
 )
+from .volume_envelope import (
+    InvalidVolumeEnvelope,
+    PCMVolumeEnvelope,
+    PCMVolumeEnvelopeProcessor,
+    StreamingVolumeEnvelope,
+    StreamingVolumeEnvelopeProcessor,
+    VolumeEnvelope,
+    VolumeEnvelopeProcessor,
+    apply_volume_envelope,
+)
 
 if sys.version_info >= (3, 0):
     basestring = str

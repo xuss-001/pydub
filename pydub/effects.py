@@ -11,6 +11,15 @@ from .utils import (
 )
 from .silence import split_on_silence
 from .exceptions import TooManyMissingFrames, InvalidDuration
+from .volume_envelope import (
+    InvalidVolumeEnvelope,
+    PCMVolumeEnvelope,
+    PCMVolumeEnvelopeProcessor,
+    StreamingVolumeEnvelope,
+    StreamingVolumeEnvelopeProcessor,
+    VolumeEnvelope,
+    VolumeEnvelopeProcessor,
+)
 
 if sys.version_info >= (3, 0):
     xrange = range
@@ -339,3 +348,32 @@ def apply_gain_stereo(seg, left_gain=0.0, right_gain=0.0):
     return seg._spawn(data=output,
                 overrides={'channels': 2,
                            'frame_width': 2 * seg.sample_width})
+
+
+@register_pydub_effect
+def apply_volume_envelope(seg, keypoints, channel=None):
+    """
+    Apply a dB volume envelope defined by absolute ``(frame, gain_db)`` pairs.
+
+    The envelope is evaluated in the coordinate space of the complete
+    ``AudioSegment``.  Gain changes linearly in dB between keypoints; the
+    nearest value is held before the first and after the last keypoint.
+
+    ``channel`` uses pydub's 1-based channel numbering (1 is left/first).
+    ``None`` applies the envelope to every channel.
+    """
+    processor = VolumeEnvelopeProcessor(
+        keypoints,
+        channel=channel,
+        sample_width=seg.sample_width,
+        channels=seg.channels,
+        frame_rate=seg.frame_rate,
+    )
+    return processor.process(seg)
+
+
+def volume_envelope(seg, keypoints, channel=None):
+    return apply_volume_envelope(seg, keypoints, channel=channel)
+
+
+register_pydub_effect(volume_envelope)
