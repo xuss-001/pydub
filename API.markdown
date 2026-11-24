@@ -400,6 +400,65 @@ len(sound1) == len(sound2_plays_a_lot)
 - `gain_during_overlay` | example: `-6.0` | default: `0` (no change in volume during overlay)
   Change the original audio by this many dB while overlaying audio. This can be used to make the original audio quieter while the overlaid audio plays.
 
+### AudioSegment.mix_timeline()
+
+Mixes any number of `AudioSegment` inputs on a shared output timeline. The
+caller chooses the output frame rate, sample width (in bytes, following pydub's
+convention), and channel count. Every input has a non-negative `start_frame`
+on the output timeline and a mixing matrix whose rows are output channels and
+whose columns are the input's channels.
+
+Each input is converted to the output frame rate and sample width before its
+matrix is applied. All contributions at a frame are added together and then
+saturated once, so a quiet track can cancel part of a loud track without either
+one being clipped independently. Empty spans become silence, and the result
+lasts until the furthest track ends. Inputs and `overlay()` are not modified.
+
+```python
+from pydub import AudioSegment, TimelineTrack
+
+music = AudioSegment.from_file("music.wav")       # stereo, 44.1 kHz
+voice = AudioSegment.from_file("voice.wav")       # mono, 48 kHz
+effect = AudioSegment.from_file("effect.wav")     # mono, 16 kHz
+
+# Frames are positions on the *output* timeline (48 kHz here).
+tracks = [
+    TimelineTrack(music, start_frame=0, matrix=[
+        [1.0, 0.0],   # output left  <- left input only
+        [0.0, 1.0],   # output right <- right input only
+    ]),
+    {
+        "audio": voice,
+        "start_frame": 48000,  # one second in
+        "matrix": [[0.8], [0.8]],  # mono voice -> both output channels
+    },
+    (effect, 96000, [[0.25], [0.0]]),  # tuple form, left channel only
+]
+
+mixed = AudioSegment.mix_timeline(
+    tracks,
+    frame_rate=48000,
+    sample_width=2,  # 16-bit output
+    channels=2,
+)
+
+# Convert a 16 kHz stereo source to a 48 kHz mono output with a downmix.
+stereo_16k = AudioSegment.from_file("stereo.wav")  # 16 kHz stereo
+mono_48k = AudioSegment.mix_timeline(
+    [(stereo_16k, 0, [[0.5, 0.5]])],
+    frame_rate=48000,
+    sample_width=2,
+    channels=1,
+)
+```
+
+Keyword aliases are available for callers that use names such as
+`sample_rate=`, `bit_depth=16`, or `output_channels=`. A matrix with the wrong
+number of rows or columns, a negative/non-integer `start_frame`, or a
+non-numeric/non-finite coefficient raises a clear `ValueError` or `TypeError`.
+The same operation is also available as `AudioSegment.timeline_mix()` and as
+`pydub.mix_timeline()`.
+
 ### AudioSegment(…).apply_gain(`gain`)
 
 Change the amplitude (generally, loudness) of the `AudioSegment`. Gain is specified in dB. This method is used internally by the `+` operator.

@@ -7,6 +7,16 @@ from tempfile import NamedTemporaryFile
 import wave
 import sys
 import struct
+import math
+import numbers
+import operator
+from decimal import Decimal
+from fractions import Fraction
+from math import gcd
+try:
+    from collections.abc import Mapping
+except ImportError:
+    from collections import Mapping
 from .logging_utils import log_conversion, log_subprocess_output
 from .utils import mediainfo_json, fsdecode
 import base64
@@ -30,6 +40,7 @@ from .utils import (
     ratio_to_db,
     get_encoder_name,
     get_array_type,
+    get_min_max_value,
     audioop,
 )
 from .exceptions import (
@@ -87,6 +98,123 @@ AUDIO_FILE_EXT_ALIASES = {
 WavSubChunk = namedtuple('WavSubChunk', ['id', 'position', 'size'])
 WavData = namedtuple('WavData', ['audio_format', 'channels', 'sample_rate',
                                  'bits_per_sample', 'raw_data'])
+
+TimelineTrack = namedtuple('TimelineTrack', ['segment', 'start_frame', 'matrix'])
+
+
+def _timeline_looks_like_matrix(value):
+    if isinstance(value, (str, bytes, numbers.Number, AudioSegment)):
+        return False
+    return hasattr(value, '__iter__') and hasattr(value, '__len__')
+
+
+def _timeline_track_fields(track):
+    if isinstance(track, TimelineTrack):
+        return track.segment, track.start_frame, track.matrix
+
+    if isinstance(track, Mapping):
+        segment = None
+        for key in ('segment', 'audio', 'audio_segment', 'sound'):
+            if key in track:
+                segment = track[key]
+                break
+        if segment is None:
+            raise ValueError("timeline track is missing an audio segment")
+
+        start_frame = None
+        for key in ('start_frame', 'start', 'position', 'start_sample'):
+            if key in track:
+                start_frame = track[key]
+                break
+        if start_frame is None:
+            raise ValueError("timeline track is missing a start_frame")
+
+        matrix = None
+        for key in ('matrix', 'mix_matrix', 'mixing_matrix', 'mix',
+                    'weights', 'coefficients'):
+            if key in track:
+                matrix = track[key]
+                break
+        if matrix is None:
+            raise ValueError("timeline track is missing a mixing matrix")
+
+        return segment, start_frame, matrix
+
+    if isinstance(track, (tuple, list)):
+        if len(track) != 3:
+            raise ValueError(
+                "timeline track tuples must contain (segment, start_frame, matrix)")
+
+        first, second, third = track
+        # Also accept (segment, matrix, start_frame), since both orders are
+        # natural. A start frame is always a scalar; a matrix is a sequence.
+        if (_timeline_looks_like_matrix(second) and
+                not _timeline_looks_like_matrix(third)):
+            return first, third, second
+        return first, second, third
+
+    segment = None
+    for attr in ('segment', 'audio', 'audio_segment', 'sound'):
+        if hasattr(track, attr):
+            segment = getattr(track, attr)
+            break
+    if segment is not None:
+        for attr in ('start_frame', 'start', 'position', 'start_sample'):
+            if hasattr(track, attr):
+                start_frame = getattr(track, attr)
+                break
+        else:
+            raise ValueError("timeline track is missing a start_frame")
+
+        for attr in ('matrix', 'mix_matrix', 'mixing_matrix', 'mix',
+                     'weights', 'coefficients'):
+            if hasattr(track, attr):
+                matrix = getattr(track, attr)
+                break
+        else:
+            raise ValueError("timeline track is missing a mixing matrix")
+
+        return segment, start_frame, matrix
+
+    raise TypeError(
+        "timeline tracks must be TimelineTrack objects, mappings, tuples, or "
+        "objects exposing segment/start_frame/matrix attributes")
+
+
+def _timeline_coefficient(value, track_number, row, column):
+    if isinstance(value, bool) or isinstance(value, complex):
+        raise TypeError(
+            "track %d mixing coefficient at row %d, column %d must be a "
+            "real number" % (track_number, row, column))
+
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(
+                "track %d mixing coefficient at row %d, column %d must be "
+                "finite" % (track_number, row, column))
+        return Fraction(value)
+
+    if isinstance(value, numbers.Rational):
+        return Fraction(value.numerator, value.denominator)
+
+    if isinstance(value, numbers.Real):
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(
+                "track %d mixing coefficient at row %d, column %d must be "
+                "finite" % (track_number, row, column))
+        return Fraction(value)
+
+    raise TypeError(
+        "track %d mixing coefficient at row %d, column %d must be a real "
+        "number, got %s" % (track_number, row, column, type(value).__name__))
+
+
+def _round_fraction(value, denominator):
+    """Round a scaled integer fraction to nearest, with halves away from zero."""
+    if value >= 0:
+        return (value + denominator // 2) // denominator
+    return -((-value + denominator // 2) // denominator)
 
 
 def extract_wav_headers(data):
@@ -1172,6 +1300,254 @@ class AudioSegment(object):
         return self._spawn(data=audioop.mul(self._data, self.sample_width,
                                             db_to_float(float(volume_change))))
 
+    @classmethod
+    def mix_timeline(cls, tracks, frame_rate=None, sample_width=None,
+                     channels=None, **kwargs):
+        """
+        Mix audio segments on a shared output timeline.
+
+        ``tracks`` is an iterable of track specifications. Each specification
+        may be a :class:`TimelineTrack`, a ``(segment, start_frame, matrix)``
+        tuple (``(segment, matrix, start_frame)`` is also accepted), a mapping
+        with keys such as ``segment``/``audio``, ``start_frame``/``start`` and
+        ``matrix``/``mix_matrix``, or an object exposing those attributes.
+
+        ``start_frame`` is a non-negative frame position on the output
+        timeline. The mixing matrix has one row per output channel and one
+        column per input channel. Every segment is resampled to ``frame_rate``
+        and converted to ``sample_width`` before its matrix is applied.
+        Contributions from all tracks are summed before a single saturation
+        step, so overlapping tracks are not clipped independently.
+
+        ``sample_width`` follows pydub's usual convention and is expressed in
+        bytes (1, 2, or 4). Pass ``bit_depth=8``, ``bit_depth=16``, or
+        ``bit_depth=32`` if the width is more convenient to express in bits.
+        The output is as long as the furthest track end and gaps are silent.
+        """
+        aliases = {
+            'sample_rate': 'frame_rate',
+            'sampling_rate': 'frame_rate',
+            'output_frame_rate': 'frame_rate',
+            'output_sample_rate': 'frame_rate',
+            'output_rate': 'frame_rate',
+            'rate': 'frame_rate',
+            'output_sample_width': 'sample_width',
+            'output_channels': 'channels',
+            'channel_count': 'channels',
+            'num_channels': 'channels',
+            'n_channels': 'channels',
+        }
+        bit_depth_aliases = {
+            'bit_depth': 'sample_width',
+            'bits_per_sample': 'sample_width',
+            'output_bit_depth': 'sample_width',
+            'bits': 'sample_width',
+        }
+
+        values = {
+            'frame_rate': frame_rate,
+            'sample_width': sample_width,
+            'channels': channels,
+        }
+
+        for name, value in kwargs.items():
+            if name in bit_depth_aliases:
+                if isinstance(value, bool):
+                    raise TypeError("%s must be an integer bit depth" % name)
+                try:
+                    value = operator.index(value)
+                except TypeError:
+                    raise TypeError("%s must be an integer bit depth" % name)
+                if value <= 0 or value % 8:
+                    raise ValueError(
+                        "%s must be a positive multiple of 8 (8, 16, 24, or 32)"
+                        % name)
+                value //= 8
+                canonical = bit_depth_aliases[name]
+            else:
+                canonical = aliases.get(name)
+                if canonical is None:
+                    raise TypeError(
+                        "mix_timeline() got an unexpected keyword argument %r"
+                        % name)
+
+            if values[canonical] is not None and values[canonical] != value:
+                raise TypeError(
+                    "mix_timeline() received conflicting values for %s"
+                    % canonical)
+            values[canonical] = value
+
+        missing = [name for name, value in values.items() if value is None]
+        if missing:
+            raise TypeError(
+                "mix_timeline() missing required argument(s): %s"
+                % ", ".join(sorted(missing)))
+
+        def positive_integer(name, value):
+            if isinstance(value, bool):
+                raise TypeError("%s must be an integer" % name)
+            try:
+                value = operator.index(value)
+            except TypeError:
+                raise TypeError("%s must be an integer" % name)
+            if value <= 0:
+                raise ValueError("%s must be greater than zero" % name)
+            return value
+
+        frame_rate = positive_integer('frame_rate', values['frame_rate'])
+        channels = positive_integer('channels', values['channels'])
+
+        sample_width = values['sample_width']
+        if isinstance(sample_width, bool):
+            raise TypeError("sample_width must be an integer number of bytes")
+        try:
+            sample_width = operator.index(sample_width)
+        except TypeError:
+            raise TypeError("sample_width must be an integer number of bytes")
+        if sample_width == 3:
+            raise ValueError(
+                "sample_width=3 (24-bit) is not supported by pydub's internal "
+                "representation; use sample_width=4 or bit_depth=32")
+        if sample_width not in (1, 2, 4):
+            raise ValueError("sample_width must be 1, 2, or 4 bytes")
+
+        if (isinstance(tracks, (TimelineTrack, Mapping)) or
+                (isinstance(tracks, (tuple, list)) and len(tracks) == 3 and
+                 isinstance(tracks[0], AudioSegment))):
+            tracks = [tracks]
+        else:
+            try:
+                tracks = list(tracks)
+            except TypeError:
+                raise TypeError("tracks must be an iterable of track specifications")
+
+        prepared = []
+        total_frames = 0
+
+        for track_number, track in enumerate(tracks, 1):
+            segment, start_frame, matrix = _timeline_track_fields(track)
+
+            if not isinstance(segment, AudioSegment):
+                raise TypeError(
+                    "track %d segment must be an AudioSegment" % track_number)
+
+            if isinstance(start_frame, bool):
+                raise TypeError(
+                    "track %d start_frame must be a non-negative integer"
+                    % track_number)
+            try:
+                start_frame = operator.index(start_frame)
+            except TypeError:
+                raise TypeError(
+                    "track %d start_frame must be a non-negative integer"
+                    % track_number)
+            if start_frame < 0:
+                raise ValueError(
+                    "track %d start_frame must be non-negative" % track_number)
+
+            if isinstance(matrix, (str, bytes)):
+                raise TypeError(
+                    "track %d matrix must be a sequence of rows" % track_number)
+            try:
+                matrix_rows = list(matrix)
+            except TypeError:
+                raise TypeError(
+                    "track %d matrix must be a sequence of rows" % track_number)
+
+            if len(matrix_rows) != channels:
+                raise ValueError(
+                    "track %d matrix has %d row(s); expected %d row(s) for "
+                    "%d output channel(s)" %
+                    (track_number, len(matrix_rows), channels, channels))
+
+            coefficient_rows = []
+            for row_number, row in enumerate(matrix_rows):
+                if isinstance(row, (str, bytes)):
+                    raise TypeError(
+                        "track %d matrix row %d must be a sequence"
+                        % (track_number, row_number))
+                try:
+                    row_values = list(row)
+                except TypeError:
+                    raise TypeError(
+                        "track %d matrix row %d must be a sequence"
+                        % (track_number, row_number))
+
+                if len(row_values) != segment.channels:
+                    raise ValueError(
+                        "track %d matrix row %d has %d column(s); expected "
+                        "%d for %d input channel(s)" %
+                        (track_number, row_number, len(row_values),
+                         segment.channels, segment.channels))
+
+                coefficient_rows.append([
+                    _timeline_coefficient(value, track_number, row_number,
+                                          column_number)
+                    for column_number, value in enumerate(row_values)
+                ])
+
+            converted = segment.set_frame_rate(frame_rate)
+            converted = converted.set_sample_width(sample_width)
+            converted_frames = len(converted.raw_data) // converted.frame_width
+            total_frames = max(total_frames, start_frame + converted_frames)
+            prepared.append((start_frame, converted, coefficient_rows))
+
+        # Use one common integer scale for all coefficients. This keeps the
+        # accumulation exact (and independent of track order) while only doing
+        # one rounding + saturation pass at the very end.
+        denominator = 1
+        for _, _, coefficient_rows in prepared:
+            for row in coefficient_rows:
+                for coefficient in row:
+                    denominator = (
+                        denominator // gcd(denominator,
+                                            coefficient.denominator) *
+                        coefficient.denominator)
+
+        mixed = [[0] * total_frames for _ in range(channels)]
+
+        for start_frame, converted, coefficient_rows in prepared:
+            input_channels = converted.channels
+            all_samples = converted.get_array_of_samples()
+            channel_samples = [
+                all_samples[channel::input_channels]
+                for channel in range(input_channels)
+            ]
+
+            for output_channel, row in enumerate(coefficient_rows):
+                destination = mixed[output_channel]
+                for input_channel, coefficient in enumerate(row):
+                    if coefficient == 0:
+                        continue
+                    coefficient = (
+                        coefficient.numerator *
+                        (denominator // coefficient.denominator))
+                    position = start_frame
+                    for sample in channel_samples[input_channel]:
+                        destination[position] += coefficient * sample
+                        position += 1
+
+        low, high = get_min_max_value(sample_width * 8)
+        output_samples = array.array(get_array_type(sample_width * 8))
+        for frame in range(total_frames):
+            for channel in range(channels):
+                value = _round_fraction(mixed[channel][frame], denominator)
+                if value < low:
+                    value = low
+                elif value > high:
+                    value = high
+                output_samples.append(value)
+
+        return cls(
+            data=output_samples.tobytes(),
+            sample_width=sample_width,
+            frame_rate=frame_rate,
+            channels=channels,
+        )
+
+    timeline_mix = mix_timeline
+    mix = mix_timeline
+
     def overlay(self, seg, position=0, loop=False, times=None, gain_during_overlay=None):
         """
         Overlay the provided segment on to this segment starting at the
@@ -1395,6 +1771,18 @@ class AudioSegment(object):
         fh = self.export()
         data = base64.b64encode(fh.read()).decode('ascii')
         return src.format(base64=data)
+
+
+def mix_timeline(tracks, frame_rate=None, sample_width=None, channels=None,
+                 **kwargs):
+    """Module-level shortcut for :meth:`AudioSegment.mix_timeline`."""
+    return AudioSegment.mix_timeline(
+        tracks, frame_rate=frame_rate, sample_width=sample_width,
+        channels=channels, **kwargs)
+
+
+timeline_mix = mix_timeline
+mix = mix_timeline
 
 
 from . import effects
