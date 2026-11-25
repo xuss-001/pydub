@@ -1,7 +1,9 @@
 from functools import partial
+import array
 import os
 import sys
 import unittest
+import math
 from tempfile import (
     NamedTemporaryFile,
     mkdtemp,
@@ -9,6 +11,8 @@ from tempfile import (
 )
 import tempfile
 import struct
+
+import numpy as np
 
 from pydub import AudioSegment
 from pydub.audio_segment import extract_wav_headers
@@ -1093,6 +1097,242 @@ class AudioSegmentTests(unittest.TestCase):
 
         tempfile.tempdir = orig_tmpdir
         os.rmdir(new_tmpdir)
+
+
+class ConcatenateTests(unittest.TestCase):
+
+    def _segment(self, samples, frame_rate=1000, sample_width=2, channels=1):
+        array_type = {1: 'b', 2: 'h', 4: 'i'}[sample_width]
+        data = array.array(array_type, samples).tobytes()
+        return AudioSegment(data, metadata={
+            "channels": channels,
+            "sample_width": sample_width,
+            "frame_rate": frame_rate,
+            "frame_width": sample_width * channels,
+        })
+
+    def _equal_power_gains(self, length):
+        positions = np.arange(length, dtype=np.float64)
+        fade_out = np.sqrt((length - positions - 0.5) / length)
+        fade_in = np.sqrt((positions + 0.5) / length)
+        return fade_out, fade_in
+
+    def test_zero_frame_crossfade_is_a_hard_splice(self):
+        seg1 = self._segment([1000] * 10)
+        seg2 = self._segment([2000] * 6)
+
+        merged = AudioSegment.concatenate([seg1, seg2], crossfades=0)
+
+        self.assertEqual(merged.frame_count(), 16)
+        self.assertEqual(
+            list(merged.get_array_of_samples()),
+            [1000] * 10 + [2000] * 6)
+
+        # a scalar 0 must behave the same way for several segments
+        merged_three = AudioSegment.concatenate(
+            [seg1, seg2, seg1], crossfades=0)
+        self.assertEqual(merged_three.frame_count(), 26)
+
+    def test_single_frame_crossfade_rule(self):
+        seg1 = self._segment([1000] * 5)
+        seg2 = self._segment([2000] * 5)
+
+        merged = AudioSegment.concatenate([seg1, seg2], crossfades=1)
+        samples = list(merged.get_array_of_samples())
+
+        # one shared frame, each side scaled by sqrt(0.5), output one shorter
+        self.assertEqual(merged.frame_count(), 9)
+        self.assertEqual(samples[4],
+                         round((1000 + 2000) * math.sqrt(0.5)))
+        self.assertEqual(samples[3], 1000)
+        self.assertEqual(samples[5], 2000)
+
+    def test_total_frame_count_matches_overlap_length(self):
+        seg1 = self._segment([1000] * 10)
+        seg2 = self._segment([2000] * 6)
+        seg3 = self._segment([3000] * 8)
+
+        merged = AudioSegment.concatenate(
+            [seg1, seg2, seg3], crossfades=[4, 2])
+
+        self.assertEqual(merged.frame_count(), 10 + 6 + 8 - 4 - 2)
+
+    def test_equal_power_gains_sum_of_squares_is_one(self):
+        for length in range(1, 12):
+            fade_out, fade_in = self._equal_power_gains(length)
+            self.assertTrue(
+                np.allclose(fade_out ** 2 + fade_in ** 2, 1.0))
+
+            seg1 = self._segment([1000] * 40)
+            seg2 = self._segment([1000] * 40)
+            merged = AudioSegment.concatenate(
+                [seg1, seg2], crossfades=length)
+            region = np.array(
+                merged.get_array_of_samples(),
+                dtype=np.float64)[40 - length:40] / 1000.0
+            self.assertTrue(
+                np.allclose(region, fade_out + fade_in, atol=2e-3))
+
+    def test_join_position_after_format_conversion(self):
+        seg1 = self._segment([1000] * 40, frame_rate=8000)
+        seg2 = self._segment(
+            [2000] * 40, frame_rate=16000, sample_width=4, channels=2)
+
+        merged = AudioSegment.concatenate(
+            [seg1, seg2], crossfades=8,
+            frame_rate=16000, sample_width=2, channels=2)
+
+        converted_first = seg1.set_frame_rate(16000).set_channels(2)
+        converted_second = seg2.set_sample_width(2)
+        expected_frames = (
+            converted_first.frame_count()
+            + converted_second.frame_count() - 8)
+
+        self.assertEqual(merged.frame_rate, 16000)
+        self.assertEqual(merged.sample_width, 2)
+        self.assertEqual(merged.channels, 2)
+        self.assertEqual(merged.frame_count(), expected_frames)
+
+        # the crossfade starts exactly where the converted first segment
+        # begins its tail and contains both segments
+        join_start = int(converted_first.frame_count()) - 8
+        tail_first = np.array(
+            converted_first.get_array_of_samples(),
+            dtype=np.float64).reshape(-1, 2)[join_start:]
+        head_second = np.array(
+            converted_second.get_array_of_samples(),
+            dtype=np.float64).reshape(-1, 2)[:8]
+        fade_out, fade_in = self._equal_power_gains(8)
+        expected_join = np.clip(
+            np.round(tail_first * fade_out[:, None]
+                     + head_second * fade_in[:, None]),
+            -32768, 32767).astype(np.int16)
+        actual_join = np.array(
+            merged.get_array_of_samples(),
+            dtype=np.int16).reshape(-1, 2)[join_start:join_start + 8]
+        self.assertTrue(np.array_equal(actual_join, expected_join))
+
+    def test_overlapping_fade_regions_keep_every_contribution(self):
+        # the 4-frame middle segment is entirely covered by both joins
+        seg1 = self._segment([10000] * 10)
+        seg2 = self._segment([20000] * 4)
+        seg3 = self._segment([30000] * 8)
+
+        merged = AudioSegment.concatenate(
+            [seg1, seg2, seg3], crossfades=[4, 4])
+
+        self.assertEqual(merged.frame_count(), 10 + 4 + 8 - 8)
+
+        fade_out_1, fade_in_1 = self._equal_power_gains(4)
+        fade_out_2, fade_in_2 = self._equal_power_gains(4)
+        accumulator = np.zeros(14, dtype=np.float64)
+        accumulator[0:10] += np.r_[np.ones(6), fade_out_1] * 10000
+        accumulator[6:10] += (fade_in_1 * fade_out_2) * 20000
+        accumulator[6:14] += np.r_[fade_in_2, np.ones(4)] * 30000
+        expected = np.clip(
+            np.round(accumulator), -32768, 32767).astype(np.int16)
+
+        self.assertTrue(np.array_equal(
+            np.array(merged.get_array_of_samples()), expected))
+
+    def test_positive_and_negative_cancel_before_saturation(self):
+        seg1 = self._segment([30000] * 6)
+        seg2 = self._segment([-30000] * 6)
+
+        merged = AudioSegment.concatenate(
+            [seg1, seg2], crossfades=6)
+        samples = np.array(merged.get_array_of_samples(), dtype=np.float64)
+
+        fade_out, fade_in = self._equal_power_gains(6)
+        expected = np.clip(
+            np.round(30000 * fade_out - 30000 * fade_in),
+            -32768, 32767)
+        # contributions cancel inside the join instead of clipping first
+        self.assertTrue(np.allclose(samples, expected, atol=1))
+        self.assertLess(np.max(np.abs(samples)), 30000)
+
+    def test_saturation_happens_once_at_the_end(self):
+        # two contributions whose clipped-then-summed result would differ
+        # from their summed-then-clipped result
+        seg1 = self._segment([30000] * 4)
+        seg2 = self._segment([-25000] * 4)
+
+        merged = AudioSegment.concatenate(
+            [seg1, seg2], crossfades=4)
+        fade_out, fade_in = self._equal_power_gains(4)
+        expected = np.clip(
+            30000 * fade_out - 25000 * fade_in,
+            -32768, 32767).astype(np.int16)
+
+        self.assertTrue(np.array_equal(
+            np.array(merged.get_array_of_samples()), expected))
+
+    def test_invalid_crossfades_raise_and_leave_inputs_untouched(self):
+        seg1 = self._segment([1000] * 10)
+        seg2 = self._segment([2000] * 6)
+        snapshot = seg1.raw_data
+
+        for invalid in (-1, 1.5, '2', None, True):
+            self.assertRaises(
+                (ValueError, TypeError),
+                AudioSegment.concatenate, [seg1, seg2], invalid)
+
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate, [seg1, seg2], 11)
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate, [seg1, seg2], 7)
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate,
+            [seg1, seg2, seg1], [2])
+        self.assertRaises(
+            ValueError, AudioSegment.concatenate, [])
+        self.assertEqual(seg1.raw_data, snapshot)
+
+    def test_invalid_output_format_raises(self):
+        seg1 = self._segment([1000] * 10)
+        seg2 = self._segment([2000] * 6)
+
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate,
+            [seg1, seg2], 0, frame_rate=0)
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate,
+            [seg1, seg2], 0, sample_width=3)
+        self.assertRaises(
+            ValueError,
+            AudioSegment.concatenate,
+            [seg1, seg2], 0, channels=0)
+
+    def test_wav_round_trip_matches_in_memory_result(self):
+        for sample_width in (1, 2, 4):
+            scale = {1: 6, 2: 200, 4: 200000}[sample_width]
+            seg1 = self._segment(
+                [((i * 7 % 20) - 10) * scale for i in range(12)],
+                sample_width=sample_width)
+            seg2 = self._segment(
+                [((i * 11 % 30) - 15) * scale for i in range(9)],
+                sample_width=sample_width)
+
+            merged = AudioSegment.concatenate(
+                [seg1, seg2], crossfades=3,
+                sample_width=sample_width)
+
+            with NamedTemporaryFile('w+b', suffix='.wav', delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                merged.export(tmp_path, format='wav')
+                reloaded = AudioSegment.from_wav(tmp_path)
+                self.assertEqual(reloaded.raw_data, merged.raw_data)
+                self.assertEqual(reloaded.frame_rate, merged.frame_rate)
+                self.assertEqual(reloaded.sample_width, merged.sample_width)
+                self.assertEqual(reloaded.channels, merged.channels)
+            finally:
+                os.unlink(tmp_path)
 
 
 class SilenceTests(unittest.TestCase):

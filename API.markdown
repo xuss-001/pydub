@@ -363,6 +363,48 @@ no_crossfade2 = sound1 + sound2
 - `crossfade` | example: `3000` | default: `100` (entire duration of `AudioSegment`)
   When specified, method returns number of frames in X milliseconds of the `AudioSegment`
 
+### AudioSegment.concatenate()
+
+Joins any number of `AudioSegment` objects in order in a single call, with an independently specified crossfade (in **frames**, not milliseconds) at every join. All segments are first converted to the requested output format, and the crossfade lengths are measured against the frames of that converted output.
+
+Crossfades are **equal-power**: at frame `k` of a crossfade of length `n`, the fade-out gain is `sqrt((n - k - 0.5) / n)` and the fade-in gain is `sqrt((k + 0.5) / n)`, so the sum of the squared gains is always `1`. All scaled samples are accumulated in floating point and saturated (clipped) only once, at the end, so short segments taking part in both neighbouring joins keep every contribution instead of overwriting each other or clipping early.
+
+```python
+from pydub import AudioSegment
+
+line1 = AudioSegment.from_file("line1.wav")
+line2 = AudioSegment.from_file("line2.wav")
+line3 = AudioSegment.from_file("line3.wav")
+
+# hard splices (zero-frame crossfades), output keeps the highest input
+# sample rate / bit depth / channel count
+playlist = AudioSegment.concatenate([line1, line2, line3])
+
+# same crossfade length (240 output frames) at every join
+playlist = AudioSegment.concatenate(
+    [line1, line2, line3], crossfades=240)
+
+# a different crossfade length per join (240 frames between 1-2,
+# 480 frames between 2-3)
+playlist = AudioSegment.concatenate(
+    [line1, line2, line3], crossfades=[240, 480],
+    frame_rate=48000, sample_width=4, channels=2)
+```
+
+Edge cases:
+
+- `crossfades=0` is a plain back-to-back splice with no overlap.
+- A one-frame crossfade produces a single shared frame holding `sqrt(0.5)` (~`0.7071`) of each neighbour; the output is one frame shorter than a hard splice.
+- Crossfade values must be non-negative integers and cannot exceed either neighbouring segment's converted frame count, otherwise a `ValueError` is raised without touching the inputs.
+
+**Supported keyword arguments**:
+
+- `segments` | iterable of `AudioSegment` | required — at least one segment
+- `crossfades` | example: `[240, 480]` | default: `0` — an int applied to every join, or one frame count per join
+- `frame_rate` | example: `48000` | default: highest input sample rate
+- `sample_width` | example: `2` | default: widest input sample width (bytes: `1`, `2` or `4`)
+- `channels` | example: `2` | default: largest input channel count
+
 ### AudioSegment(…).overlay()
 
 Overlays an `AudioSegment` onto this one. In the resulting `AudioSegment` they will play simultaneously. If the overlaid `AudioSegment` is longer than this one, the result will be truncated (so the end of the overlaid sound will be cut off). The result is always the same length as this `AudioSegment` even when using the `loop`, and `times` keyword arguments.

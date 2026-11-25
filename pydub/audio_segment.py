@@ -30,6 +30,7 @@ from .utils import (
     ratio_to_db,
     get_encoder_name,
     get_array_type,
+    get_min_max_value,
     audioop,
 )
 from .exceptions import (
@@ -1275,6 +1276,186 @@ class AudioSegment(object):
         obj = seg1._spawn(data=output)
         output.close()
         return obj
+
+    @classmethod
+    def concatenate(cls, segments, crossfades=0, frame_rate=None,
+                    sample_width=None, channels=None):
+        """
+        Concatenate several AudioSegments in order, joining each pair with an
+        independent crossfade whose length is given in *frames* (not ms).
+
+        The crossfades use an equal-power (constant power) curve: at every
+        frame of a crossfade of length ``n`` the fade-out gain is
+        ``sqrt((n - k - 0.5) / n)`` and the fade-in gain is
+        ``sqrt((k + 0.5) / n)`` (``k`` = 0..n-1), so the sum of the squared
+        gains is always exactly 1.
+
+        All input segments are first converted to the requested output format
+        (frame rate, sample width / bit depth and channel count) and every
+        crossfade length is measured against the frames of that converted
+        format. All scaled contributions are summed in floating point and the
+        result is saturated (clipped) only once, at the very end, so a short
+        segment taking part in both neighbouring joins never overwrites
+        existing audio and is never clipped early.
+
+        segments (iterable of AudioSegment):
+            The audio segments to join, in playback order. Must contain at
+            least one segment.
+
+        crossfades (int or iterable of int):
+            Crossfade length in output frames for each join. A single int
+            applies the same length to every join (``0`` by default). There
+            must be exactly ``len(segments) - 1`` values.
+
+        frame_rate (int, optional):
+            Output sample rate in Hz. Defaults to the highest input rate.
+
+        sample_width (int, optional):
+            Output sample width in bytes (1 = 8-bit, 2 = 16-bit,
+            4 = 32-bit). Defaults to the widest input sample width.
+
+        channels (int, optional):
+            Output channel count. Defaults to the largest input channel
+            count.
+
+        Edge cases:
+            * A crossfade of 0 frames is a hard splice: the two converted
+              segments are concatenated back to back with no overlap.
+            * A crossfade of 1 frame is a single shared frame holding
+              ``sqrt(0.5)`` (~0.7071) of each segment; the output is one
+              frame shorter than a hard splice.
+            * A crossfade must be a non-negative integer no longer than
+              either of the two neighbouring segments, otherwise a
+              ``ValueError`` is raised and the input segments are left
+              untouched.
+        """
+        import numpy as np
+
+        segments = list(segments)
+        if not segments:
+            raise ValueError(
+                "At least one AudioSegment is required to concatenate")
+        if not all(isinstance(seg, AudioSegment) for seg in segments):
+            raise TypeError(
+                "all segments must be AudioSegment instances")
+
+        join_count = len(segments) - 1
+        if isinstance(crossfades, int) and not isinstance(crossfades, bool):
+            crossfade_list = [crossfades] * join_count
+        else:
+            try:
+                crossfade_list = list(crossfades)
+            except TypeError:
+                raise TypeError(
+                    "crossfades must be an int or an iterable of ints")
+            if len(crossfade_list) != join_count:
+                raise ValueError(
+                    "Expected {0} crossfade value(s) for {1} segment(s), "
+                    "got {2}".format(join_count, len(segments),
+                                     len(crossfade_list)))
+
+        # Validate every crossfade before converting anything so that an
+        # invalid call never mutates or rebuilds the caller's segments.
+        for index, crossfade in enumerate(crossfade_list):
+            if isinstance(crossfade, bool) or not isinstance(crossfade, int):
+                raise ValueError(
+                    "crossfade lengths must be non-negative integer frame "
+                    "counts; got {0!r} at index {1}".format(
+                        crossfade, index))
+            if crossfade < 0:
+                raise ValueError(
+                    "crossfade lengths must be non-negative integer frame "
+                    "counts; got {0} at index {1}".format(crossfade, index))
+
+        target_frame_rate = (frame_rate if frame_rate is not None
+                             else max(seg.frame_rate for seg in segments))
+        target_sample_width = (sample_width if sample_width is not None
+                               else max(seg.sample_width for seg in segments))
+        target_channels = (channels if channels is not None
+                           else max(seg.channels for seg in segments))
+
+        if target_frame_rate <= 0 or not isinstance(target_frame_rate, int):
+            raise ValueError(
+                "frame_rate must be a positive integer, got {0!r}".format(
+                    target_frame_rate))
+        if target_sample_width not in (1, 2, 4):
+            raise ValueError(
+                "sample_width must be one of 1 (8-bit), 2 (16-bit) or "
+                "4 (32-bit), got {0!r}".format(target_sample_width))
+        if target_channels <= 0 or not isinstance(target_channels, int):
+            raise ValueError(
+                "channels must be a positive integer, got {0!r}".format(
+                    target_channels))
+
+        converted = [
+            seg.set_channels(target_channels)
+               .set_frame_rate(target_frame_rate)
+               .set_sample_width(target_sample_width)
+            for seg in segments
+        ]
+        frame_counts = [int(seg.frame_count()) for seg in converted]
+
+        for index, crossfade in enumerate(crossfade_list):
+            if crossfade > frame_counts[index]:
+                raise ValueError(
+                    "Crossfade {0} is longer than the preceding "
+                    "AudioSegment ({1} frame(s))".format(
+                        crossfade, frame_counts[index]))
+            if crossfade > frame_counts[index + 1]:
+                raise ValueError(
+                    "Crossfade {0} is longer than the following "
+                    "AudioSegment ({1} frame(s))".format(
+                        crossfade, frame_counts[index + 1]))
+
+        total_frames = sum(frame_counts) - sum(crossfade_list)
+
+        numpy_dtype = np.dtype(
+            "<i{0}".format(target_sample_width))
+        min_value, max_value = get_min_max_value(target_sample_width * 8)
+
+        accumulator = np.zeros(
+            (total_frames, target_channels), dtype=np.float64)
+
+        cursor = 0
+        for index, seg in enumerate(converted):
+            frame_count = frame_counts[index]
+            samples = np.frombuffer(seg._data, dtype=numpy_dtype)
+            samples = samples.reshape(frame_count, target_channels)
+            samples = samples.astype(np.float64)
+
+            gain = np.ones(frame_count, dtype=np.float64)
+
+            # Fade out over the tail overlapping the *next* segment. Gains are
+            # multiplied (never overwritten) so a short segment whose head and
+            # tail fade regions overlap keeps both contributions.
+            if index < join_count:
+                tail = crossfade_list[index]
+                if tail:
+                    positions = np.arange(tail, dtype=np.float64)
+                    fade_out = np.sqrt((tail - positions - 0.5) / tail)
+                    gain[frame_count - tail:] *= fade_out
+
+            # fade in over the head overlapping the *previous* segment
+            if index > 0:
+                head = crossfade_list[index - 1]
+                if head:
+                    positions = np.arange(head, dtype=np.float64)
+                    gain[:head] *= np.sqrt((positions + 0.5) / head)
+
+            accumulator[cursor:cursor + frame_count] += samples * gain[:, None]
+            cursor += frame_count
+            if index < join_count:
+                cursor -= crossfade_list[index]
+
+        clipped = np.clip(accumulator, min_value, max_value)
+        output_data = clipped.astype(numpy_dtype).tobytes()
+
+        return cls(data=output_data, metadata={
+            "channels": target_channels,
+            "sample_width": target_sample_width,
+            "frame_rate": target_frame_rate,
+            "frame_width": target_channels * target_sample_width,
+        })
 
     def fade(self, to_gain=0, from_gain=0, start=None, end=None,
              duration=None):
