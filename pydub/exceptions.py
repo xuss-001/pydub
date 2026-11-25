@@ -30,3 +30,15 @@ class CouldntEncodeError(PydubException):
 
 class MissingAudioParameter(PydubException):
     pass
+
+
+class InvalidAudioFormat(PydubException, ValueError):
+    """
+    The audio format is invalid, or changed while a stream was active.
+    """
+
+
+class InvalidLimiterSettings(PydubException, ValueError):
+    """
+    A limiter setting is invalid.
+    """

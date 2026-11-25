@@ -612,6 +612,84 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+### AudioSegment(…).lookahead_limiter()
+
+Applies a channel-linked look-ahead peak limiter. The output peak stays at
+or below `ceiling`; reductions ramp in before a future peak and recover after
+the overload has passed. The result always has exactly the same frame count
+as the input, with no added padding at the beginning or end.
+
+```python
+from pydub import AudioSegment
+
+sound = AudioSegment.from_file("live-capture.wav")
+limited = sound.lookahead_limiter(
+    ceiling=-1.0,      # -1 dBFS (0.5 and below mean normalized amplitude)
+    lookahead_ms=5.0,  # gain reduction begins up to 5 ms before a peak
+    release_ms=50.0,   # gradual recovery after the overload
+)
+```
+
+`AudioSegment.limiter()`, `AudioSegment.limit()` and
+`AudioSegment.apply_lookahead_limiter()` are aliases. `ceiling_db`,
+`max_peak`, `peak_limit`, `attack_ms`, `release`, `recovery_ms` and
+`recovery_time_ms` are accepted as descriptive keyword aliases.
+
+### LookaheadLimiter (streaming PCM)
+
+`pydub.LookaheadLimiter` is the stateful form of the same limiter. It accepts
+signed PCM chunks whose length is a whole number of frames. Feed audio with
+`process()` (also available as `feed()`, `push()` or `write()`), then call
+`finish()` exactly once to drain the delay.
+
+```python
+from pydub import LookaheadLimiter
+
+limiter = LookaheadLimiter(
+    sample_width=2,
+    frame_rate=48000,
+    channels=2,
+    ceiling=-1.0,
+    lookahead_ms=5.0,
+    release_ms=50.0,
+)
+
+for pcm_chunk in pcm_chunks:
+    output.write(limiter.process(pcm_chunk))
+output.write(limiter.finish())  # writes the delayed tail, once only
+```
+
+Rules and guarantees:
+
+- **Latency:** in real time, the first `lookahead_ms` of output is withheld
+  (up to one extra frame because the look-ahead length is rounded to frames).
+  `latency_frames` and `latency_ms` report the exact delay. The whole-segment
+  effect drains this delay internally, so its output is aligned with the
+  input and has no leading silence.
+- **Finish:** `finish()`, `flush()` or `drain()` returns all remaining frames.
+  Every frame is emitted once, with no gaps or duplicates. Calling any of
+  them again returns `b""`; feeding audio after finishing raises
+  `RuntimeError`.
+- **Chunk invariance:** if every chunk contains complete frames, splitting a
+  stream differently produces byte-for-byte identical output, provided the
+  same format and settings are used. Incomplete frames raise
+  `InvalidAudioFormat` rather than growing an unbounded partial-frame buffer.
+- **Stereo/multichannel:** one gain is computed per frame and applied to every
+  channel, so inter-channel level relationships are preserved.
+- **Recovery:** once a peak leaves the look-ahead window, gain ramps linearly
+  back to its current target over `release_ms` (and to unity when no further
+  peak is pending).
+- **Bounded memory:** only the look-ahead delay and its monotonic peak index
+  are retained; memory does not grow with stream duration. `pending_frames`
+  never exceeds `lookahead_frames + 1`.
+- **Validation:** negative or non-finite timings, non-positive channel counts,
+  invalid sample widths, and ceilings outside the PCM range raise
+  `InvalidLimiterSettings`. A changed declared format or a different
+  `AudioSegment` format raises `InvalidAudioFormat`. Raw PCM has no embedded
+  format, so callers should pass the format again with a chunk
+  (`limiter.process(data, frame_rate=...)`) or pass `AudioSegment` chunks when
+  format changes are possible.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().

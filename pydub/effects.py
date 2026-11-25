@@ -11,6 +11,23 @@ from .utils import (
 )
 from .silence import split_on_silence
 from .exceptions import TooManyMissingFrames, InvalidDuration
+from .limiter import (
+    LookaheadLimiter,
+    StreamingLimiter,
+    LookAheadLimiter,
+    StreamingLookaheadLimiter,
+    StreamingLookAheadLimiter,
+    PCMStreamLimiter,
+    PCMChunkLimiter,
+    Limiter,
+    lookahead_limiter,
+    limiter,
+    streaming_limiter,
+    streaming_lookahead_limiter,
+    look_ahead_limiter,
+    apply_lookahead_limiter,
+    limit_peaks,
+)
 
 if sys.version_info >= (3, 0):
     xrange = range
