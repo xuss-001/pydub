@@ -673,6 +673,101 @@ Returns list of audio segments from splitting audio_segment on silent sections.
   When the length of the silence is less than the keep_silence duration it is split evenly between the preceding and following non-silent segments.
   If True is specified, all the silence is kept, if False none is kept.
 
+### silence.StreamingSilenceTrimmer()
+
+Trim silence from a recording while it is still arriving. Feed **same-format**
+`AudioSegment` chunks with `feed()` and call `flush()` after the last chunk.
+Both methods return a `TrimResult`, which can be unpacked as
+`audio, ranges = result`.
+
+Silence is detected from the RMS of overlapping windows. Detection state is
+kept in absolute sample frames, so silence crossing chunk boundaries is
+judged exactly as it would be in a single segment. `flush()` evaluates the
+final available window and emits the remaining tail. A tail shorter than
+`min_silence_len` cannot by itself satisfy the minimum-silence test, so it is
+retained. Memory use is bounded by the detection window, the kept padding, and
+a fixed internal output block rather than the total recording length.
+
+Each range is a half-open sample-frame range: the start frame is included and
+the end frame is excluded. It contains these four integer fields:
+
+- `original_start`, `original_end`: position in the complete input recording.
+- `output_start`, `output_end`: position in the concatenated trimmed output.
+
+Padded ranges that overlap are merged. Samples are never emitted twice, and no
+crossfade or other fading is applied.
+
+`trim_silence(audio_segment, ...)` is the one-shot equivalent and returns the
+same kind of result. `trim_silence_stream(chunks, ...)` yields completed
+results as an iterable is consumed.
+
+**Supported keyword arguments**:
+
+- `min_silence_len` | example: `500` | default: 1000
+  Minimum silent duration in milliseconds. A shorter silence is retained.
+  The value is converted to sample frames using the input frame rate.
+
+- `silence_thresh` | example: `-20` | default: -16
+  RMS volume threshold in dBFS. A window whose RMS is less than or equal to
+  this value is silent.
+
+- `keep_silence` | example: `50` | default: 100
+  Milliseconds of silence to retain at both ends of each kept range. `True`
+  keeps all silence between retained ranges, `False` keeps none.
+
+- `seek_step` | example: `10` | default: 1
+  Distance in milliseconds between the starts of adjacent RMS windows. It is
+  converted to sample frames with a minimum of one frame.
+
+Continuous WAV reading example:
+
+```python
+import wave
+
+from pydub import AudioSegment
+from pydub.silence import StreamingSilenceTrimmer
+
+trimmer = StreamingSilenceTrimmer(
+    min_silence_len=500,   # ms
+    silence_thresh=-35,    # dBFS RMS
+    keep_silence=100,      # ms at both ends
+    seek_step=10,          # ms between window starts
+)
+
+trimmed = AudioSegment.empty()
+frame_ranges = []
+
+with wave.open("recording.wav", "rb") as source:
+    sample_width = source.getsampwidth()
+    frame_rate = source.getframerate()
+    channels = source.getnchannels()
+
+    while True:
+        raw_frames = source.readframes(frame_rate // 2)  # 500 ms
+        if not raw_frames:
+            break
+
+        chunk = AudioSegment(
+            data=raw_frames,
+            sample_width=sample_width,
+            frame_rate=frame_rate,
+            channels=channels,
+        )
+        completed_audio, completed_ranges = trimmer.feed(chunk)
+        trimmed += completed_audio
+        frame_ranges.extend(completed_ranges)
+
+completed_audio, completed_ranges = trimmer.flush()
+trimmed += completed_audio
+frame_ranges.extend(completed_ranges)
+
+for item in frame_ranges:
+    print(
+        item.original_start, item.original_end,
+        item.output_start, item.output_end,
+    )
+```
+
 ### silence.detect_leading_silence()
 
 Returns the millisecond/index that the leading silence ends. If there is no end it will return the length of the audio_segment.
