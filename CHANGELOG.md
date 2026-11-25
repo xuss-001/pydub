@@ -1,3 +1,6 @@
+# Unreleased
+- Add `pydub.resampler.PCMResampler`, a stateful, band-limiting PCM resampler for chunked and multichannel audio
+
 # v0.25.1
 - Fix crashing bug in new scipy-powered EQ effects
 

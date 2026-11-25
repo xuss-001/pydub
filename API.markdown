@@ -477,6 +477,66 @@ Creates an equivalent version of this `AudioSegment` with the specified sample w
 
 Creates an equivalent version of this `AudioSegment` with the specified frame rate (in Hz). Increasing this value does not generally cause a reduction in quality. Reducing it *definitely does* cause a loss in quality. Higher frame rate means larger frequency response (higher frequencies can be represented).
 
+### PCMResampler(`output_frame_rate`)
+
+`pydub.resampler.PCMResampler` converts chunked PCM audio as it arrives. Unlike
+`set_frame_rate()`, it preserves filter state between chunks, so resampling one
+segment at once and resampling the same audio frame by frame produce identical
+output bytes. The processor keeps only a short look-ahead window, not the
+whole input.
+
+```python
+from pydub import AudioSegment
+from pydub.resampler import PCMChunk, PCMResampler
+
+segment = AudioSegment.from_wav("input.wav")
+resampler = PCMResampler(output_frame_rate=16000)
+pieces = []
+frames_per_chunk = 320
+frame_width = segment.frame_width
+raw = segment.raw_data
+for start in range(0, int(segment.frame_count()), frames_per_chunk):
+    begin = start * frame_width
+    end = min(len(raw), (start + frames_per_chunk) * frame_width)
+    chunk = PCMChunk(
+        raw[begin:end],
+        segment.sample_width,
+        segment.channels,
+        segment.frame_rate,
+    )
+    pieces.append(resampler.process(chunk))
+pieces.append(resampler.finish())
+
+output = AudioSegment(
+    data=b"".join(pieces),
+    sample_width=resampler.sample_width,
+    frame_rate=resampler.output_frame_rate,
+    channels=resampler.channels,
+)
+```
+
+The first chunk determines `sample_width`, `channels`, and `input_frame_rate`
+when it is an `AudioSegment` or a `PCMChunk`. Raw bytes need those values in the
+constructor (or the first `process()` call). A later chunk with a different
+format raises `PCMFormatMismatchError`. Every chunk must contain a whole number
+of PCM frames.
+
+`process()` returns PCM bytes that are ready to emit. Output timing is
+`k * input_frame_rate / output_frame_rate`; no time offset is introduced. The
+processor withholds an output sample until the right half of its symmetric
+windowed-sinc kernel is available. With the default `filter_half_width=64`
+this is 64 input frames of look-ahead (about 1.33 ms at 48 kHz). Missing audio
+outside the input is treated as silence, so the first and last kernel widths
+are edge transients.
+
+`finish()` drains the remaining samples and zero-pads the right edge. It returns
+`b""` on every subsequent call. The total output frame count is
+`round(input_frames * output_frame_rate / input_frame_rate)`, independent of
+chunk boundaries. The default kernel is a Blackman-windowed sinc low-pass, so
+downsampling suppresses frequencies above the target Nyquist frequency; the
+48 kHz to 16 kHz case attenuates a 10 kHz tone by more than 40 dB relative to
+a 1 kHz tone outside the transition edges.
+
 ### AudioSegment(…).set_channels()
 
 Creates an equivalent version of this `AudioSegment` with the specified number of channels (1 is Mono, 2 is Stereo). Converting from mono to stereo does not cause any audible change. Converting from stereo to mono may result in loss of quality (but only if the left and right chanels differ).

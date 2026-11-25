@@ -30,3 +30,11 @@ class CouldntEncodeError(PydubException):
 
 class MissingAudioParameter(PydubException):
     pass
+
+
+class PCMFormatError(ValueError, PydubException):
+    """The PCM format is missing or invalid."""
+
+
+class PCMFormatMismatchError(PCMFormatError):
+    """A later chunk has a different format from the first chunk."""
