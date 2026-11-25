@@ -612,6 +612,46 @@ Collection of DSP effects that are implemented by `AudioSegment` objects.
 
 Make a copy of this `AudioSegment` and inverts the phase of the signal. Can generate anti-phase waves for noise suppression or cancellation.
 
+## Volume Envelope
+
+`pydub.envelope.VolumeEnvelope` applies a decibel gain envelope to raw PCM audio that arrives in consecutive chunks, so long recordings can be processed while streaming without decoding the whole file first. The envelope is defined by `(frame_position, gain_db)` keypoints using absolute sample frame positions over the whole recording. Gain is interpolated linearly in decibels between keypoints, and the nearest gain is held before the first and after the last keypoint. Splitting the same audio into any chunk sizes produces exactly the same result as processing it in one piece.
+
+```python
+from pydub import AudioSegment
+from pydub.envelope import VolumeEnvelope
+
+segment = AudioSegment.from_file("voice_over.wav")
+
+# fade the left channel from -60 dB to unity gain over the whole recording
+envelope = VolumeEnvelope(
+    keypoints=[(0, -60.0), (segment.frame_count(), 0.0)],
+    channels=0,
+)
+
+processed = [envelope.process(chunk) for chunk in segment[::100]]
+result = AudioSegment(
+    b"".join(processed),
+    sample_width=segment.sample_width,
+    channels=segment.channels,
+    frame_rate=segment.frame_rate,
+)
+```
+
+Raw PCM bytes can also be processed directly; the first chunk fixes the stream format and later chunks must match it:
+
+```python
+envelope = VolumeEnvelope([(0, -12.0), (441000, 0.0)])
+out = envelope.process(pcm_bytes, sample_width=2, channel_count=2)
+```
+
+**Supported keyword arguments**:
+
+- `keypoints` | example: `[(0, -60.0), (44100, 0.0)]` | default: None
+  Iterable of `(frame_position, gain_db)` pairs. Frame positions are absolute, non-negative, strictly increasing integers; gains must be finite decibel values.
+
+- `channels` | example: `0` | default: None
+  Channel index (or iterable of indices) the envelope is applied to. If None, all channels are processed. Unselected channels are passed through unchanged.
+
 ## Silence
 
 Various functions for finding/manipulating silence in AudioSegments. For creating silent AudioSegments, see AudioSegment.silent().
